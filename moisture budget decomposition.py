@@ -1,223 +1,123 @@
-import xarray as xr
-import dask
 import numpy as np
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-from matplotlib.colors import BoundaryNorm, ListedColormap
-from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
-from tqdm import tqdm
-import warnings
+import xarray as xr
+from scipy.stats import t as tdist
 
-warnings.filterwarnings('ignore')
+EARTH_R = 6371e3
+G = 9.81
+RHO_W = 1000.0
+FACTOR = -(100.0 * 86400.0 * 1000.0) / (RHO_W * G)
 
-# File paths
-q_file = r'F:\era5\q.nc'
-u_file = r'F:\era5\u.nc'
-v_file = r'F:\era5\v.nc'
+Q_FILE = r'F:\era5\q.nc'
+U_FILE = r'F:\era5\u.nc'
+V_FILE = r'F:\era5\v.nc'
+T0, T1 = '1980-01-01', '2022-12-01'
+OUT_NC = r'F:\era5\dy_th_te.nc'
 
-# Load data
-with dask.config.set(scheduler='threads'):
-    with tqdm(total=3, desc="Load files") as pbar:
-        q = xr.open_dataset(q_file, chunks={'time': 48})['q']
-        pbar.update(1)
-        pbar.set_postfix_str("q loaded")
-
-        U = xr.open_dataset(u_file, chunks={'time': 48})['u']
-        pbar.update(1)
-        pbar.set_postfix_str("u loaded")
-
-        V = xr.open_dataset(v_file, chunks={'time': 48})['v']
-        pbar.update(1)
-        pbar.set_postfix_str("v loaded")
+REGIONS = [('ETP', -5, 5, 150, 240), ('STP', -30, -5, 150, 205),
+           ('MC', -15, 15, 100, 150), ('NTP', 5, 15, 160, 275)]
 
 
-with tqdm(total=3, desc="Time slice") as pbar:
-    q = q.sel(time=slice('1980-01-01', '2022-12-01'))
-    pbar.update(1)
-    U = U.sel(time=slice('1980-01-01', '2022-12-01'))
-    pbar.update(1)
-    V = V.sel(time=slice('1980-01-01', '2022-12-01'))
-    pbar.update(1)
-
-with tqdm(total=3, desc="Sort lev") as pbar:
-    if not np.all(np.diff(q.lev) >= 0):
-        q = q.reindex(lev=np.sort(q.lev.values))
-    pbar.update(1)
-
-    if not np.all(np.diff(U.lev) >= 0):
-        U = U.reindex(lev=np.sort(U.lev.values))
-    pbar.update(1)
-
-    if not np.all(np.diff(V.lev) >= 0):
-        V = V.reindex(lev=np.sort(V.lev.values))
-    pbar.update(1)
-
-# Time mean
-with tqdm(total=3, desc="Time mean") as pbar:
-    q_mean = q.mean(dim='time').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("q mean done")
-
-    U_mean = U.mean(dim='time').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("u mean done")
-
-    V_mean = V.mean(dim='time').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("v mean done")
-
-# Flux decomposition
-with tqdm(total=6, desc="Flux calc") as pbar:
-    horizontal_thermodynamic_flux_u = q * U_mean
-    pbar.update(1)
-    pbar.set_postfix_str("th flux u")
-
-    horizontal_thermodynamic_flux_v = q * V_mean
-    pbar.update(1)
-    pbar.set_postfix_str("th flux v")
-
-    horizontal_dynamic_flux_u = q_mean * U
-    pbar.update(1)
-    pbar.set_postfix_str("dyn flux u")
-
-    horizontal_dynamic_flux_v = q_mean * V
-    pbar.update(1)
-    pbar.set_postfix_str("dyn flux v")
-
-    horizontal_turbulent_flux_u = (U - U_mean) * (q - q_mean)
-    pbar.update(1)
-    pbar.set_postfix_str("eddy flux u")
-
-    horizontal_turbulent_flux_v = (V - V_mean) * (q - q_mean)
-    pbar.update(1)
-    pbar.set_postfix_str("eddy flux v")
-
-# Vertical integral
-with tqdm(total=6, desc="Vertical integral") as pbar:
-    thermodynamic_flux_u_int = horizontal_thermodynamic_flux_u.integrate(coord='lev').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("th int u")
-
-    thermodynamic_flux_v_int = horizontal_thermodynamic_flux_v.integrate(coord='lev').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("th int v")
-
-    dynamic_flux_u_int = horizontal_dynamic_flux_u.integrate(coord='lev').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("dyn int u")
-
-    dynamic_flux_v_int = horizontal_dynamic_flux_v.integrate(coord='lev').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("dyn int v")
-
-    turbulent_flux_u_int = horizontal_turbulent_flux_u.integrate(coord='lev').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("eddy int u")
-
-    turbulent_flux_v_int = horizontal_turbulent_flux_v.integrate(coord='lev').compute()
-    pbar.update(1)
-    pbar.set_postfix_str("eddy int v")
+def read(name, path):
+    da = xr.open_dataset(path, chunks={'time': 48})[name].sel(time=slice(T0, T1))
+    if 'lev' in da.dims and not np.all(np.diff(da.lev) >= 0):
+        da = da.reindex(lev=np.sort(da.lev.values))
+    return da.astype('float32')
 
 
-def horizontal_divergence(data_u, data_v, desc="Div calc"):
-    with tqdm(total=4, desc=desc) as pbar:
-        dx = 111e3 * np.cos(np.deg2rad(data_u.lat)) * np.abs(data_u.lon.diff('lon')[0])
-        pbar.update(1)
-        pbar.set_postfix_str("dx done")
-
-        dy = 111e3 * np.abs(data_u.lat.diff('lat')[0])
-        pbar.update(1)
-        pbar.set_postfix_str("dy done")
-
-        dudx = data_u.differentiate('lon') / dx
-        pbar.update(1)
-        pbar.set_postfix_str("dudx done")
-
-        dvdy = data_v.differentiate('lat') / dy
-        pbar.update(1)
-        pbar.set_postfix_str("dvdy done")
-    return dudx + dvdy
+def spherical_divergence(Fu, Fv, lat, lon):
+    dlon = np.deg2rad(lon[1] - lon[0])
+    phi = np.deg2rad(lat)
+    coslat = np.cos(phi)
+    Fu = np.asarray(Fu, dtype=np.float64)
+    Fv = np.asarray(Fv, dtype=np.float64)
+    dFu = (np.roll(Fu, -1, axis=-1) - np.roll(Fu, 1, axis=-1)) / (2 * dlon)
+    dG = np.gradient(Fv * coslat[None, :, None], phi, axis=-2)
+    div = (dFu + dG) / (EARTH_R * coslat[None, :, None])
+    div[:, np.abs(lat) >= 89.5, :] = np.nan
+    return div
 
 
-horizontal_thermodynamic_divergence = horizontal_divergence(
-    thermodynamic_flux_u_int, thermodynamic_flux_v_int, "Thermo div"
-).compute()
-
-horizontal_dynamic_divergence = horizontal_divergence(
-    dynamic_flux_u_int, dynamic_flux_v_int, "Dynamic div"
-).compute()
-
-horizontal_turbulent_divergence = horizontal_divergence(
-    turbulent_flux_u_int, turbulent_flux_v_int, "Eddy div"
-)
-
-# Unit convert to mm/day
-with tqdm(total=3, desc="Unit convert") as pbar:
-    horizontal_thermodynamic_integral_mm_day = horizontal_thermodynamic_divergence / (1000 * 9.81)
-    pbar.update(1)
-    pbar.set_postfix_str("thermo unit")
-
-    horizontal_dynamic_integral_mm_day =horizontal_dynamic_divergence / (1000 * 9.81)
-    pbar.update(1)
-    pbar.set_postfix_str("dynamic unit")
-
-    horizontal_turbulent_integral_mm_day = horizontal_turbulent_divergence / (1000 * 9.81)
-    pbar.update(1)
-    pbar.set_postfix_str("eddy unit")
+def linear_trend(Y, x):
+    valid = ~np.isnan(Y)
+    n = valid.sum(axis=0).astype(float)
+    nsafe = np.maximum(n, 1.0)
+    xv = np.asarray(x, float)[:, None, None]
+    xm = np.nansum(np.where(valid, xv, 0), axis=0) / nsafe
+    xc = xv - xm
+    ym = np.nansum(np.where(valid, Y, 0), axis=0) / nsafe
+    yc = np.where(valid, Y - ym, 0.0)
+    x2 = np.maximum(np.nansum((xc ** 2) * valid, axis=0), 1e-30)
+    slope = np.nansum(yc * xc, axis=0) / x2
+    resid = np.nansum(((yc - slope * xc) ** 2) * valid, axis=0)
+    se = np.sqrt((resid / np.maximum(n - 2, 1)) / x2)
+    tstat = np.divide(slope, se, out=np.full_like(slope, np.nan), where=se > 0)
+    p = 2 * tdist.sf(np.abs(tstat), np.maximum(n - 2, 1))
+    ok = n >= 10
+    return np.where(ok, slope * 10.0, np.nan), np.where(ok, p, np.nan)
 
 
-def linear_trend(data, desc="Trend calc"):
-    data = data.transpose('time', 'lat', 'lon')
-    time = data.time.dt.year.values
-    trends = np.full(data.shape[1:], np.nan)
-    total_points = data.shape[1] * data.shape[2]
-    with tqdm(total=total_points, desc=desc, ncols=80) as pbar:
-        for j in range(data.shape[1]):
-            for k in range(data.shape[2]):
-                series = data[:, j, k].values
-                valid_mask = ~np.isnan(series)
-                valid_series = series[valid_mask]
-                valid_time = time[valid_mask]
-                if len(valid_series) >= 10:
-                    norm_time = (valid_time - valid_time.min()) / (valid_time.max() - valid_time.min())
-                    try:
-                        poly_coeffs = np.polyfit(norm_time, valid_series, deg=1)
-                        trends[j, k] = poly_coeffs[0] * (valid_time.max() - valid_time.min())
-                    except np.linalg.LinAlgError:
-                        pass
-                pbar.update(1)
-    return xr.DataArray(trends, dims=['lat', 'lon'], coords=[data.lat, data.lon])
+def region_mean(arr, lat, lon, box):
+    _, a0, a1, b0, b1 = box
+    la = (lat >= a0) & (lat <= a1)
+    lo = (lon >= b0) & (lon <= b1)
+    sub = arr[np.ix_(la, lo)]
+    w = np.cos(np.deg2rad(lat[la]))[:, None] * np.ones((1, int(lo.sum())))
+    m = ~np.isnan(sub)
+    return float(np.nansum(sub[m] * w[m]) / np.nansum(w[m]))
 
 
-dy = linear_trend(horizontal_dynamic_integral_mm_day, "Dynamic trend")
-th = linear_trend(horizontal_thermodynamic_integral_mm_day, "Thermo trend")
-te = linear_trend(horizontal_turbulent_integral_mm_day, "Eddy trend")
+def main():
+    q = read('q', Q_FILE)
+    u = read('u', U_FILE)
+    v = read('v', V_FILE)
 
-# Output dataset
-with tqdm(total=1, desc="Build dataset") as pbar:
-    trend_dataset = xr.Dataset(
-        {
-            'dy': dy,
-            'th': th,
-            'te': te
-        },
-        attrs={
-            'description': 'Dynamic/Thermodynamic/Eddy moisture flux divergence trend',
-            'units': '(mm/day)/decade',
-            'time_period': '1980-2022',
-        }
-    )
-    trend_dataset['dy'].attrs = {'long_name': 'Dynamic component trend'}
-    trend_dataset['th'].attrs = {'long_name': 'Thermodynamic component trend'}
-    trend_dataset['te'].attrs = {'long_name': 'Eddy turbulent component trend'}
-    pbar.update(1)
+    q_bar, u_bar, v_bar = q.mean('time'), u.mean('time'), v.mean('time')
+    q_a, u_a, v_a = q - q_bar, u - u_bar, v - v_bar
 
-output_file = r'F:\dy_th_te.nc'
-with tqdm(total=1, desc="Save nc") as pbar:
-    try:
-        trend_dataset.to_netcdf(output_file)
-        pbar.update(1)
-    except Exception:
-        pass
+    flux = xr.Dataset({
+        'th_u': (q_a * u_bar).integrate(coord='lev'),
+        'th_v': (q_a * v_bar).integrate(coord='lev'),
+        'dy_u': (q_bar * u_a).integrate(coord='lev'),
+        'dy_v': (q_bar * v_a).integrate(coord='lev'),
+        'te_u': (q_a * u_a).integrate(coord='lev'),
+        'te_v': (q_a * v_a).integrate(coord='lev'),
+    }).compute()
+
+    lat, lon = flux.lat.values, flux.lon.values
+    mm = {}
+    for k in ('th', 'dy', 'te'):
+        d = spherical_divergence(
+            flux[f'{k}_u'].transpose('time', 'lat', 'lon').values,
+            flux[f'{k}_v'].transpose('time', 'lat', 'lon').values, lat, lon)
+        mm[k] = d * FACTOR
+
+    time_year = q.time.dt.year.values + (q.time.dt.month.values - 1) / 12.0
+    trend, pval = {}, {}
+    for k in ('th', 'dy', 'te'):
+        trend[k], pval[k] = linear_trend(mm[k], time_year)
+
+    coords = {'lat': lat, 'lon': lon}
+    dy = xr.DataArray(trend['dy'], dims=['lat', 'lon'], coords=coords)
+    th = xr.DataArray(trend['th'], dims=['lat', 'lon'], coords=coords)
+    te = xr.DataArray(trend['te'], dims=['lat', 'lon'], coords=coords)
+
+    xr.Dataset(
+        {'dy': dy, 'th': th, 'te': te,
+         'pdy': (('lat', 'lon'), pval['dy']),
+         'pth': (('lat', 'lon'), pval['th']),
+         'pte': (('lat', 'lon'), pval['te'])},
+        coords=coords,
+        attrs={'units': '(mm/day)/decade', 'period': f'{T0} to {T1}'}
+    ).to_netcdf(OUT_NC)
+
+    total = dy + th + te
+    fields = [('total', total.values), ('dy', dy.values),
+              ('th', th.values), ('te', te.values)]
+    print('region      total        dy        th        te')
+    for box in REGIONS:
+        row = '  '.join(f'{region_mean(arr, lat, lon, box):8.4f}' for _, arr in fields)
+        print(f'{box[0]:<6s} ' + row)
 
 
+if __name__ == '__main__':
+    main()
